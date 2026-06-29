@@ -204,8 +204,7 @@ static inline void tableNor(unsigned long seed)
 double __attribute__ ((no_sanitize("address", "undefined"))) gaussZiggurat(double mean, double variance)
 {
   if (!__builtin_expect(tableNordDone, 1)) {
-    fprintf(stderr, "%s(): RNG not initialized, run randominit() first\n", __func__);
-    abort();
+    tableNor(12345UL);
   }
 
   hz = SHR3;
