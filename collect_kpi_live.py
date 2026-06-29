@@ -26,7 +26,7 @@ for line in sys.stdin:
         ue_data[rnti]["ul_bytes"] = tx
 
     # UL 물리 계층: MCS, NPRB, SNR, BLER
-    m = re.search(r'UE (\w+): ulsch.*BLER (\S+) MCS \(0\) (\d+).*NPRB\s+(\d+).*SNR (\S+) dB', line)
+    m = re.search(r'UE (\w+): ulsch.*BLER (\S+) MCS \(\d+\) (\d+).*NPRB\s+(\d+).*SNR (\S+) dB', line)
     if m:
         rnti = m.group(1)
         ue_data.setdefault(rnti, {}).update({
