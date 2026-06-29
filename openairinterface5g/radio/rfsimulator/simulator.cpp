@@ -582,6 +582,7 @@ static void rfsimulator_readconfig(rfsimulator_state_t *rfsimulator)
 
       break;
     } else if (strcmp(rfsimuParam[p].strlistptr[i], "chanmod") == 0) {
+      randominit();
       init_channelmod();
       load_channellist(rfsimulator->tx_num_channels,
                        rfsimulator->rx_num_channels,

@@ -356,6 +356,7 @@ static struct complexd R_sqrt_22_EPA_medium[16] = {{0.8375,0.0}, {0.5249,0.0}, {
 void tdlModel(int  tdl_paths, double *tdl_delays, double *tdl_amps_dB, double DS_TDL, channel_desc_t *chan_desc ) {
   int nb_rx=chan_desc-> nb_rx;
   int nb_tx=chan_desc-> nb_tx;
+  chan_desc->Doppler_phase_cur = calloc(nb_rx, sizeof(float));
   chan_desc->nb_taps        = tdl_paths;
   chan_desc->Td             = tdl_delays[tdl_paths-1]*DS_TDL;
   printf("last path (%d) at %f * %e = %e\n",tdl_paths-1,tdl_delays[tdl_paths-1],DS_TDL,chan_desc->Td);
@@ -371,12 +372,13 @@ void tdlModel(int  tdl_paths, double *tdl_delays, double *tdl_amps_dB, double DS
     sum_amps += chan_desc->amps[i];
   }
 
+  double *scaled_delays = calloc(chan_desc->nb_taps, sizeof(double));
   for (int i = 0; i<chan_desc->nb_taps; i++) {
-    chan_desc->amps[i] /= sum_amps;
-    tdl_delays[i] *= DS_TDL;
+    chan_desc->amps[i]   /= sum_amps;
+    scaled_delays[i]      = tdl_delays[i] * DS_TDL;
   }
 
-  chan_desc->delays         = tdl_delays;
+  chan_desc->delays         = scaled_delays;
   chan_desc->aoa            = 0;
   chan_desc->random_aoa     = 0;
   chan_desc->ch             = calloc(nb_tx*nb_rx, sizeof(struct complexd *));
@@ -499,6 +501,7 @@ double get_normalization_ch_factor(channel_desc_t *desc)
     return 1.0;
   }
 
+  randominit();
   uint16_t N_average = 1000;
   double accumulated_ch_power = 0;
   struct complexd a[desc->nb_taps][desc->nb_tx * desc->nb_rx];
