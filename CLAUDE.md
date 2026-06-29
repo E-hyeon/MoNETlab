@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MoNETlab is an O-RAN research testbed implementing an AI-based RAN scheduling **dApp** (distributed Application). The system predicts per-UE channel KPIs using LSTM/TCN models and computes fairness-aware PRB scheduling weights in real time.
+MoNETlab is an O-RAN research testbed implementing an AI-based RAN scheduling **dApp** (distributed Application). The system predicts per-UE channel KPIs using a BigDL Chronos TCN model and computes fairness-aware PRB scheduling weights in real time.
 
 ## Key Commands
 
@@ -19,36 +19,33 @@ tail -f gnb_live.log | python3 collect_kpi_live.py
 
 ### Model Training
 ```bash
-# Build kpi_combined.csv (required by live/retrain scripts)
-head -1 kpi_baseline.csv > kpi_combined.csv
-tail -n +2 kpi_baseline.csv >> kpi_combined.csv
-tail -n +2 kpi_live.csv    >> kpi_combined.csv
+# Train Chronos TCN model from baseline data
+conda run -n chronos python3 chronos_train.py    # full version with OpenVINO benchmark
+conda run -n chronos python3 chronos_final.py    # streamlined version
 
-# Train global attention-LSTM from baseline data
-python3 train_rnn_global.py
-
-# Retrain/fine-tune global model from combined data
-python3 train_rnn_global_live.py   # reads kpi_combined.csv
-
-# Retrain legacy per-UE models from combined data
-python3 train_rnn_live.py          # writes model_ue_<rnti>.pth per UE
-
-# Train BigDL Chronos TCN model (with OpenVINO benchmark)
-python3 chronos_train.py    # full version with OpenVINO speed comparison
-python3 chronos_final.py    # streamlined version
+# Retrain Chronos TCN from live data (with 50-epoch checkpoint support)
+conda run -n chronos python3 chronos_retrain.py  # reads kpi_live.csv
 ```
 
-### Running the dApp Controller (pick one)
+### Running the dApp Controller
 ```bash
-python3 dapp_controller_global.py   # global attention-LSTM (recommended)
-python3 dapp_controller_chronos.py  # BigDL TCN variant
-python3 dapp_controller.py          # legacy per-UE LSTM
+conda run -n chronos python3 dapp_controller_chronos.py  # Chronos TCN-based PRB scheduler
+```
+
+### Evaluation & Visualization
+```bash
+conda run -n chronos python3 eval_dapp.py         # Chronos TCN vs persistence MAE/latency
+conda run -n chronos python3 compare_dapp.py      # dApp ON vs OFF Jain's fairness comparison
+conda run -n chronos python3 plot_dapp_compare.py # generates dapp_compare.png
 ```
 
 ### Testbed Setup
 ```bash
-bash full_restart.sh        # restart UE tunnels, iperf3, and KPI collector
-bash setup_ue_traffic.sh    # configure routing/iperf3 only (no KPI restart)
+bash setup_namespaces.sh  # create ue1/ue2 network namespaces
+bash start_gnb.sh         # start OAI gNB
+bash start_ue1.sh         # start UE1
+bash start_ue2.sh         # start UE2
+bash full_restart.sh      # restart UE tunnels, iperf3, and KPI collector
 ```
 
 ### Fairness Analysis
@@ -64,31 +61,24 @@ python3 plot_fairness.py # generates kpi_analysis_plot.png
 OAI gNB log (gnb_live.log)
   └─► collect_kpi.py / collect_kpi_live.py
         └─► kpi_baseline.csv / kpi_live.csv
-              └─► train_rnn_global.py  →  model artifacts (*.pth, *.pkl)
-              └─► dapp_controller_global.py
+              └─► chronos_train.py / chronos_retrain.py  →  chronos_forecaster / scaler_chronos.pkl
+              └─► dapp_controller_chronos.py
                     └─► /tmp/dapp_weights.json  (scheduling weights per UE RNTI)
+                          └─► OAI gNB MAC scheduler (source patch required)
 ```
 
 ### KPI Features
 All models share the same 6 features: `snr`, `bler`, `nprb`, `mcs_ul`, `ul_bytes`, `dl_bytes`.
 
-### Model Variants
+### Model Scripts
 
-| Script | Model | Notes |
-|---|---|---|
-| `train_rnn_global.py` | `GlobalChannelRNN` (LSTM + attention) | Single model for all UEs; UE identity via embedding |
-| `train_rnn_global_live.py` | Same architecture | Fine-tunes from existing `model_global.pth`; expands `ue_encoder.pkl` for new UEs |
-| `chronos_train.py` | BigDL `TCNForecaster` | Full version: MAE/MSE eval + OpenVINO speed benchmark |
-| `chronos_final.py` | BigDL `TCNForecaster` | Streamlined version; same output as `chronos_train.py` |
-| `train_rnn.py` | `ChannelRNN` (plain LSTM) | Legacy per-UE baseline training from `kpi_baseline.csv` |
-| `train_rnn_live.py` | `ChannelRNN` (plain LSTM) | Legacy per-UE live retrain from `kpi_combined.csv` |
-
-### `GlobalChannelRNN` Architecture
-- Input: KPI sequence `(B, T=10, 6)` concatenated with UE embedding `(B, T, 8)`
-- LSTM: 2 layers, hidden=128, dropout=0.2
-- Attention: linear scoring over time steps → weighted sum context vector
-- Output: next-step KPI prediction `(B, 6)`
-- Unknown UEs (not seen at training) map to `padding_idx = n_ues` → zero embedding vector
+| Script | Description |
+|---|---|
+| `chronos_train.py` | BigDL `TCNForecaster` 학습 (full: MAE/MSE eval + OpenVINO benchmark) |
+| `chronos_final.py` | BigDL `TCNForecaster` 학습 (streamlined) |
+| `chronos_retrain.py` | kpi_live.csv로 재학습; 50 epoch마다 체크포인트 저장 |
+| `chronos_live.py` | 실시간 스트리밍 재학습 |
+| `dapp_controller_chronos.py` | 예측 기반 PRB 가중치 컨트롤러 |
 
 ### Fairness Weight Formula
 ```python
@@ -100,16 +90,12 @@ Equal weights are applied when no predictions are available yet (first `seq_leng
 ### Model Artifacts
 | File | Contents |
 |---|---|
-| `model_global.pth` | GlobalChannelRNN state dict |
-| `scaler_global.pkl` | `MinMaxScaler` fitted on training data |
-| `features_global.pkl` | Ordered feature name list |
-| `ue_encoder.pkl` | `LabelEncoder` mapping RNTI string → int index |
-| `chronos_forecaster` | BigDL TCN model (single file in repo) |
-| `scaler_chronos.pkl` | `StandardScaler` for Chronos |
+| `chronos_forecaster` | BigDL TCNForecaster model |
+| `scaler_chronos.pkl` | `StandardScaler` fitted on training data |
 
 ### Python Environment
-- Virtual env at `.venv/` (Python 3.12) — activate with `source .venv/bin/activate`
-- Key deps: `torch`, `scikit-learn`, `joblib`, `pandas`, `bigdl-chronos` (for Chronos TCN scripts)
+- Conda env `chronos` (Python 3.9) — `conda run -n chronos python3 <script>`
+- Key deps: `bigdl-chronos`, `scikit-learn`, `joblib`, `pandas`
 
 ### Infrastructure Stack
 - **OAI gNB**: `openairinterface5g/` — config at `targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.e2.ej.conf` (Band 78, 106 PRB, rfsim, E2 agent enabled)
@@ -119,4 +105,4 @@ Equal weights are applied when no predictions are available yet (first `seq_leng
 - **Traffic**: iperf3 UDP 20 Mbps; ue1 on port 5201, ue2 on port 5202
 
 ### `oai-channel-prediction/` Subproject
-Empty scaffold (`src/`, `oai-patch/`, `docker/`, `k8s/`, `tests/`, `docs/`) for packaging the ML pipeline as a containerised O-RAN xApp/dApp. Not yet implemented.
+Scaffold for packaging the ML pipeline as a containerised O-RAN xApp/dApp. Not yet implemented.
