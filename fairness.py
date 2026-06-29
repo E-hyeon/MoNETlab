@@ -4,7 +4,7 @@ import numpy as np
 df = pd.read_csv("kpi_live.csv")
 df["timestamp"] = pd.to_datetime(df["timestamp"])
 df = df.sort_values("timestamp")
-df["dl_bytes"] = pd.to_numeric(df["dl_bytes"], errors="coerce").fillna(0)
+df["nprb"] = pd.to_numeric(df["nprb"], errors="coerce").fillna(0)
 
 def jains(x):
     x = x[x > 0]
@@ -13,10 +13,16 @@ def jains(x):
 
 result = df.groupby(pd.Grouper(key="timestamp", freq="10s")).apply(
     lambda g: pd.Series({
-        "fairness":      jains(g.groupby("rnti")["dl_bytes"].sum()),
-        "total_dl_mbps": g["dl_bytes"].sum() * 8 / 1e6 / 10,
-        "ue_count":      g["rnti"].nunique(),
-    }), include_groups=False
+        "fairness":       jains(g.groupby("rnti")["nprb"].sum()),
+        "total_nprb":     g["nprb"].sum(),
+        "ue1_nprb":       g[g["rnti"] == g["rnti"].unique()[0]]["nprb"].sum() if g["rnti"].nunique() >= 1 else 0,
+        "ue2_nprb":       g[g["rnti"] == g["rnti"].unique()[-1]]["nprb"].sum() if g["rnti"].nunique() >= 2 else 0,
+        "ue_count":       g["rnti"].nunique(),
+    })
 )
 
-print(result.dropna().tail(20))
+r = result.dropna()
+print(r.tail(20))
+print(f"\n평균 Jain's Fairness : {r['fairness'].mean():.4f}")
+print(f"평균 UE1 nPRB       : {r['ue1_nprb'].mean():.1f}")
+print(f"평균 UE2 nPRB       : {r['ue2_nprb'].mean():.1f}")
