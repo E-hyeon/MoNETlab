@@ -26,3 +26,7 @@ __pycache__/
 # Installer / binary / misc
 Miniconda3-*.sh
 *.pptx
+
+.train_rnn.py.swp
+.idea/
+gnb.log
