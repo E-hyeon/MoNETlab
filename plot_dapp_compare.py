@@ -1,5 +1,5 @@
 """
-plot_dapp_compare.py — dApp ON vs OFF 비교 그래프 생성
+plot_dapp_compare.py — OAI 기본 / Chronos dApp(TCN 예측) / Reactive Baseline(no AI) / EWMA dApp 4자 비교 그래프
 출력: dapp_compare.png (3개 subplot)
 """
 
@@ -19,10 +19,13 @@ LOOKBACK        = 10
 FORECASTER_PATH = 'chronos_forecaster'
 SCALER_PATH     = 'scaler_chronos.pkl'
 KPI_CSV         = 'kpi_live.csv'
-TARGET_UES      = ['21ab', 'f402']
+MIN_SAMPLES     = 50   # 자동 UE 선택 시 최소 표본 수 (너무 적은 UE 제외)
 WINDOW          = '10s'
+EWMA_ALPHA      = 0.3
 COLOR_OFF       = '#5B8DB8'
 COLOR_ON        = '#E07B54'
+COLOR_REACT     = '#5FA777'
+COLOR_EWMA      = '#9B7FC7'
 
 
 def jains(vals):
@@ -30,6 +33,17 @@ def jains(vals):
     if len(vals) == 0:
         return float('nan')
     return vals.sum()**2 / (len(vals) * (vals**2).sum())
+
+
+def pick_target_ues(df_all: pd.DataFrame, min_samples: int = MIN_SAMPLES) -> list:
+    """평균 SNR 차이가 가장 큰 두 UE를 자동 선택 (표본 부족 UE는 제외)."""
+    counts = df_all['rnti'].value_counts()
+    candidates = counts[counts >= min_samples].index.tolist()
+    if len(candidates) < 2:
+        candidates = counts.index.tolist()
+    snr_mean = df_all[df_all['rnti'].isin(candidates)].groupby('rnti')['snr'].mean()
+    hi_ue, lo_ue = snr_mean.idxmax(), snr_mean.idxmin()
+    return [hi_ue, lo_ue]
 
 
 # ── 모델 로드 ──────────────────────────────────────────────────────
@@ -55,11 +69,16 @@ df_all = df_all.sort_values('timestamp').reset_index(drop=True)
 for f in FEATURES:
     df_all[f] = pd.to_numeric(df_all[f], errors='coerce').fillna(0)
 df_all['rnti'] = df_all['rnti'].astype(str)
+
+# 평균 SNR 차이가 가장 큰 두 UE를 자동 선택
+TARGET_UES = pick_target_ues(df_all)
 df = df_all[df_all['rnti'].isin(TARGET_UES)].copy()
 ues = TARGET_UES
 n_ues = len(ues)
+print(f"자동 선택된 대상 UE (SNR 차이 최대): {ues}")
+ue_snr_mean = {ue: df[df['rnti'] == ue]['snr'].mean() for ue in ues}
 
-# ── UE별 예측 ─────────────────────────────────────────────────────
+# ── UE별 예측 (Chronos TCN) ─────────────────────────────────────────
 print("Chronos 예측 중...")
 ue_pred_df = []
 for ue in ues:
@@ -75,6 +94,24 @@ for ue in ues:
 
 pred_df = pd.DataFrame(ue_pred_df).set_index('timestamp')
 
+# ── UE별 EWMA(alpha=0.3) 다음 값 예측 ──────────────────────────────
+print(f"EWMA(alpha={EWMA_ALPHA}) 예측 중...")
+ewma_pred_rows = []
+for ue in ues:
+    sub = df[df['rnti'] == ue][['timestamp', 'snr', 'bler']].sort_values('timestamp').reset_index(drop=True)
+    level = sub[['snr', 'bler']].ewm(alpha=EWMA_ALPHA, adjust=False).mean().shift(1)
+    n_valid = 0
+    for i in range(len(sub)):
+        if pd.isna(level.loc[i, 'snr']):
+            continue
+        ewma_pred_rows.append({'timestamp': sub.iloc[i]['timestamp'], 'rnti': ue,
+                                'ewma_snr': float(level.loc[i, 'snr']),
+                                'ewma_bler': float(level.loc[i, 'bler'])})
+        n_valid += 1
+    print(f"  UE {ue}: {n_valid}개 완료")
+
+ewma_pred_df = pd.DataFrame(ewma_pred_rows).set_index('timestamp')
+
 # ── bytes/PRB 효율 ─────────────────────────────────────────────────
 eff = {}
 for ue in ues:
@@ -82,12 +119,26 @@ for ue in ues:
     valid = sub[sub['nprb'] > 0]
     eff[ue] = (valid['ul_bytes'] / valid['nprb']).mean() if len(valid) > 0 else 1.0
 
-# ── 10s 윈도우별 계산 ─────────────────────────────────────────────
-actual_df = df[['timestamp', 'rnti', 'nprb', 'ul_bytes']].set_index('timestamp')
+def score_weights(snr_bler: dict) -> dict:
+    """{ue: (snr, bler)} → fairness 가중치 (dApp 컨트롤러와 동일 산식)"""
+    scores = {}
+    for ue in ues:
+        snr, bler = snr_bler.get(ue, (1.0, 0.0))
+        snr = max(snr, 0.1)
+        scores[ue] = (1.0 / snr) * (1.0 + bler * 5)
+    total_score = sum(scores.values()) or 1.0
+    return {ue: scores[ue] / total_score for ue in ues}
 
-ts_list, f_byte_off_list, f_byte_on_list = [], [], []
-ue_byte_off = {ue: [] for ue in ues}
-ue_byte_on  = {ue: [] for ue in ues}
+
+# ── 10s 윈도우별 계산 (snr/bler는 Reactive Baseline용으로 함께 보관) ──
+actual_df = df[['timestamp', 'rnti', 'nprb', 'ul_bytes', 'snr', 'bler']].set_index('timestamp')
+
+ts_list = []
+f_byte_off_list, f_byte_on_list, f_byte_react_list, f_byte_ewma_list = [], [], [], []
+ue_byte_off   = {ue: [] for ue in ues}
+ue_byte_on    = {ue: [] for ue in ues}
+ue_byte_react = {ue: [] for ue in ues}
+ue_byte_ewma  = {ue: [] for ue in ues}
 
 for period, grp_a in actual_df.groupby(pd.Grouper(freq=WINDOW)):
     if grp_a['rnti'].nunique() < 2:
@@ -99,84 +150,120 @@ for period, grp_a in actual_df.groupby(pd.Grouper(freq=WINDOW)):
         continue
 
     period_end = period + pd.Timedelta(WINDOW)
+
+    # Chronos dApp: 슬라이딩 윈도로 예측된 다음 스텝 SNR/BLER 기반 가중치
     grp_p = pred_df[(pred_df.index >= period) & (pred_df.index < period_end)]
     if grp_p.empty:
-        weights = {ue: 1.0 / n_ues for ue in ues}
+        weights_on = {ue: 1.0 / n_ues for ue in ues}
     else:
         avg_pred = grp_p.groupby('rnti')[['pred_snr', 'pred_bler']].mean()
-        scores = {}
-        for ue in ues:
-            snr  = max(float(avg_pred.loc[ue, 'pred_snr'])  if ue in avg_pred.index else 1.0, 0.1)
-            bler = float(avg_pred.loc[ue, 'pred_bler']) if ue in avg_pred.index else 0.0
-            scores[ue] = (1.0 / snr) * (1.0 + bler * 5)
-        total_score = sum(scores.values()) or 1.0
-        weights = {ue: scores[ue] / total_score for ue in ues}
+        weights_on = score_weights({
+            ue: (float(avg_pred.loc[ue, 'pred_snr']), float(avg_pred.loc[ue, 'pred_bler']))
+            for ue in ues if ue in avg_pred.index
+        })
 
-    dapp_nprb  = {ue: total_nprb * weights[ue] for ue in ues}
-    dapp_bytes = {ue: dapp_nprb[ue] * eff[ue]  for ue in ues}
-    off_bytes  = {ue: float(actual_bytes.get(ue, 0)) for ue in ues}
+    # Reactive Baseline (AI 예측 없음): "현재" 윈도우의 실측 SNR/BLER 평균만 사용
+    avg_actual = grp_a.groupby('rnti')[['snr', 'bler']].mean()
+    weights_react = score_weights({
+        ue: (float(avg_actual.loc[ue, 'snr']), float(avg_actual.loc[ue, 'bler']))
+        for ue in ues if ue in avg_actual.index
+    })
 
-    f_off = jains([off_bytes[ue]  for ue in ues])
-    f_on  = jains([dapp_bytes[ue] for ue in ues])
+    # EWMA dApp: alpha=0.3 지수가중이동평균으로 예측된 다음 값 사용
+    grp_e = ewma_pred_df[(ewma_pred_df.index >= period) & (ewma_pred_df.index < period_end)]
+    if grp_e.empty:
+        weights_ewma = {ue: 1.0 / n_ues for ue in ues}
+    else:
+        avg_ewma = grp_e.groupby('rnti')[['ewma_snr', 'ewma_bler']].mean()
+        weights_ewma = score_weights({
+            ue: (float(avg_ewma.loc[ue, 'ewma_snr']), float(avg_ewma.loc[ue, 'ewma_bler']))
+            for ue in ues if ue in avg_ewma.index
+        })
+
+    dapp_nprb    = {ue: total_nprb * weights_on[ue]    for ue in ues}
+    dapp_bytes   = {ue: dapp_nprb[ue] * eff[ue]         for ue in ues}
+    react_nprb   = {ue: total_nprb * weights_react[ue] for ue in ues}
+    react_bytes  = {ue: react_nprb[ue] * eff[ue]        for ue in ues}
+    ewma_nprb    = {ue: total_nprb * weights_ewma[ue]   for ue in ues}
+    ewma_bytes   = {ue: ewma_nprb[ue] * eff[ue]          for ue in ues}
+    off_bytes    = {ue: float(actual_bytes.get(ue, 0)) for ue in ues}
+
+    f_off   = jains([off_bytes[ue]   for ue in ues])
+    f_on    = jains([dapp_bytes[ue]  for ue in ues])
+    f_react = jains([react_bytes[ue] for ue in ues])
+    f_ewma  = jains([ewma_bytes[ue]  for ue in ues])
 
     ts_list.append(period)
     f_byte_off_list.append(f_off)
     f_byte_on_list.append(f_on)
+    f_byte_react_list.append(f_react)
+    f_byte_ewma_list.append(f_ewma)
     for ue in ues:
         ue_byte_off[ue].append(off_bytes[ue])
         ue_byte_on[ue].append(dapp_bytes[ue])
+        ue_byte_react[ue].append(react_bytes[ue])
+        ue_byte_ewma[ue].append(ewma_bytes[ue])
 
 print(f"\n윈도우 수: {len(ts_list)}")
 
 # ── 집계 ──────────────────────────────────────────────────────────
-mean_off = np.nanmean(f_byte_off_list)
-mean_on  = np.nanmean(f_byte_on_list)
-ue_avg_off = {ue: np.mean(ue_byte_off[ue]) for ue in ues}
-ue_avg_on  = {ue: np.mean(ue_byte_on[ue])  for ue in ues}
+mean_off   = np.nanmean(f_byte_off_list)
+mean_on    = np.nanmean(f_byte_on_list)
+mean_react = np.nanmean(f_byte_react_list)
+mean_ewma  = np.nanmean(f_byte_ewma_list)
+ue_avg_off   = {ue: np.mean(ue_byte_off[ue])   for ue in ues}
+ue_avg_on    = {ue: np.mean(ue_byte_on[ue])    for ue in ues}
+ue_avg_react = {ue: np.mean(ue_byte_react[ue]) for ue in ues}
+ue_avg_ewma  = {ue: np.mean(ue_byte_ewma[ue])  for ue in ues}
 
 # ── 그래프 ────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-fig.suptitle("Chronos TCN dApp ON vs OFF — Fairness Comparison\n"
-             "(UE1: 21ab SNR=23.8 dB  |  UE2: f402 SNR=15.7 dB with packet loss)",
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle("OAI Default vs Chronos dApp vs Reactive Baseline vs EWMA dApp — Fairness Comparison\n"
+             f"(UE1: {ues[0]} SNR={ue_snr_mean[ues[0]]:.1f} dB  |  "
+             f"UE2: {ues[1]} SNR={ue_snr_mean[ues[1]]:.1f} dB)",
              fontsize=12, fontweight='bold')
+
+LABELS  = ['OAI default', 'Chronos dApp\n(TCN prediction)',
+           'Reactive Baseline\n(no AI prediction)', 'EWMA dApp\n(alpha=0.3)']
+COLORS  = [COLOR_OFF, COLOR_ON, COLOR_REACT, COLOR_EWMA]
 
 # ── (1) Jain's Fairness 막대 ──────────────────────────────────────
 ax = axes[0]
-bars = ax.bar(['dApp OFF\n(OAI default)', 'dApp ON\n(Chronos TCN)'],
-              [mean_off, mean_on],
-              color=[COLOR_OFF, COLOR_ON], width=0.45, edgecolor='white', linewidth=1.2)
+vals = [mean_off, mean_on, mean_react, mean_ewma]
+bars = ax.bar(LABELS, vals, color=COLORS, width=0.6, edgecolor='white', linewidth=1.2)
 ax.set_ylim(0.75, 1.02)
 ax.set_ylabel("Jain's Fairness Index", fontsize=11)
 ax.set_title("Throughput Fairness", fontsize=11, fontweight='bold')
 ax.axhline(1.0, color='gray', linestyle='--', linewidth=0.8, alpha=0.6)
-for bar, val in zip(bars, [mean_off, mean_on]):
+for bar, val in zip(bars, vals):
     ax.text(bar.get_x() + bar.get_width()/2, val + 0.003,
             f'{val:.4f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
-arrow_x = 0.72
-ax.annotate('', xy=(arrow_x, mean_on - 0.001), xytext=(arrow_x, mean_off + 0.001),
-            arrowprops=dict(arrowstyle='->', color='green', lw=2))
-ax.text(arrow_x + 0.05, (mean_off + mean_on)/2,
-        f'+{mean_on-mean_off:.3f}', color='green', fontsize=10, va='center')
+ax.tick_params(axis='x', labelsize=8)
 ax.spines[['top','right']].set_visible(False)
 ax.grid(axis='y', alpha=0.3)
 
 # ── (2) UE별 Throughput 막대 ─────────────────────────────────────
 ax = axes[1]
-ue_labels = [f'UE1\n(21ab)\nSNR={23.8}dB', f'UE2\n(f402)\nSNR={15.7}dB']
+ue_labels = [f'UE1\n({ues[0]})\nSNR={ue_snr_mean[ues[0]]:.1f}dB',
+             f'UE2\n({ues[1]})\nSNR={ue_snr_mean[ues[1]]:.1f}dB']
 x = np.arange(2)
-w = 0.3
-b1 = ax.bar(x - w/2, [ue_avg_off[ue] for ue in ues], w,
-            label='dApp OFF', color=COLOR_OFF, edgecolor='white')
-b2 = ax.bar(x + w/2, [ue_avg_on[ue]  for ue in ues], w,
-            label='dApp ON',  color=COLOR_ON,  edgecolor='white')
+w = 0.2
+b1 = ax.bar(x - 1.5*w, [ue_avg_off[ue]   for ue in ues], w,
+            label=LABELS[0], color=COLOR_OFF,   edgecolor='white')
+b2 = ax.bar(x - 0.5*w, [ue_avg_on[ue]    for ue in ues], w,
+            label=LABELS[1], color=COLOR_ON,    edgecolor='white')
+b3 = ax.bar(x + 0.5*w, [ue_avg_react[ue] for ue in ues], w,
+            label=LABELS[2], color=COLOR_REACT, edgecolor='white')
+b4 = ax.bar(x + 1.5*w, [ue_avg_ewma[ue]  for ue in ues], w,
+            label=LABELS[3], color=COLOR_EWMA,  edgecolor='white')
 ax.set_xticks(x)
 ax.set_xticklabels(ue_labels, fontsize=10)
 ax.set_ylabel("Avg UL Throughput (bytes/10s)", fontsize=11)
 ax.set_title("Per-UE Throughput", fontsize=11, fontweight='bold')
-for bar in list(b1) + list(b2):
+for bar in list(b1) + list(b2) + list(b3) + list(b4):
     ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-            f'{bar.get_height():.0f}', ha='center', va='bottom', fontsize=9)
-ax.legend(fontsize=10)
+            f'{bar.get_height():.0f}', ha='center', va='bottom', fontsize=7)
+ax.legend(fontsize=7)
 ax.spines[['top','right']].set_visible(False)
 ax.grid(axis='y', alpha=0.3)
 
@@ -184,19 +271,29 @@ ax.grid(axis='y', alpha=0.3)
 ax = axes[2]
 ts = pd.Series(ts_list)
 roll = 20   # 200s 이동평균
-f_off_s = pd.Series(f_byte_off_list).rolling(roll, min_periods=1).mean()
-f_on_s  = pd.Series(f_byte_on_list).rolling(roll, min_periods=1).mean()
+f_off_s   = pd.Series(f_byte_off_list).rolling(roll, min_periods=1).mean()
+f_on_s    = pd.Series(f_byte_on_list).rolling(roll, min_periods=1).mean()
+f_react_s = pd.Series(f_byte_react_list).rolling(roll, min_periods=1).mean()
+f_ewma_s  = pd.Series(f_byte_ewma_list).rolling(roll, min_periods=1).mean()
 
-ax.plot(ts, f_off_s, color=COLOR_OFF, linewidth=1.5, label='dApp OFF', alpha=0.9)
-ax.plot(ts, f_on_s,  color=COLOR_ON,  linewidth=1.5, label='dApp ON',  alpha=0.9)
+ax.plot(ts, f_off_s,   color=COLOR_OFF,   linewidth=1.5, label=LABELS[0], alpha=0.9)
+ax.plot(ts, f_on_s,    color=COLOR_ON,    linewidth=1.5, label=LABELS[1], alpha=0.9)
+ax.plot(ts, f_react_s, color=COLOR_REACT, linewidth=1.5, label=LABELS[2], alpha=0.9)
+ax.plot(ts, f_ewma_s,  color=COLOR_EWMA,  linewidth=1.5, label=LABELS[3], alpha=0.9)
 ax.fill_between(ts, f_off_s, f_on_s,
-                where=(f_on_s >= f_off_s), alpha=0.15, color='green', label='dApp gain')
+                where=(f_on_s >= f_off_s), alpha=0.10, color=COLOR_ON, label='Chronos gain')
+ax.fill_between(ts, f_off_s, f_react_s,
+                where=(f_react_s >= f_off_s), alpha=0.10, color=COLOR_REACT, label='Reactive gain')
+ax.fill_between(ts, f_off_s, f_ewma_s,
+                where=(f_ewma_s >= f_off_s), alpha=0.10, color=COLOR_EWMA, label='EWMA gain')
 ax.set_ylim(0.4, 1.05)
 ax.set_ylabel("Jain's Fairness Index", fontsize=11)
 ax.set_title(f"Fairness Over Time ({roll*10}s rolling avg)", fontsize=11, fontweight='bold')
-ax.axhline(mean_off, color=COLOR_OFF, linestyle=':', linewidth=1, alpha=0.7)
-ax.axhline(mean_on,  color=COLOR_ON,  linestyle=':', linewidth=1, alpha=0.7)
-ax.legend(fontsize=9)
+ax.axhline(mean_off,   color=COLOR_OFF,   linestyle=':', linewidth=1, alpha=0.7)
+ax.axhline(mean_on,    color=COLOR_ON,    linestyle=':', linewidth=1, alpha=0.7)
+ax.axhline(mean_react, color=COLOR_REACT, linestyle=':', linewidth=1, alpha=0.7)
+ax.axhline(mean_ewma,  color=COLOR_EWMA,  linestyle=':', linewidth=1, alpha=0.7)
+ax.legend(fontsize=7)
 ax.tick_params(axis='x', rotation=20)
 ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%m/%d\n%H:%M'))
 ax.spines[['top','right']].set_visible(False)

@@ -8,6 +8,7 @@ chronos_checkpoint
 kpi_baseline.csv
 kpi_combined.csv
 kpi_live.csv
+kpi_fast.csv
 
 # Logs
 *.log
