@@ -4,17 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MoNETlab is an O-RAN research testbed implementing AI-based and baseline RAN scheduling logic for per-UE fairness-aware PRB weighting. Three interchangeable "next-value estimators" feed the same weighting formula:
+MoNETlab is an O-RAN research testbed implementing AI-based and baseline RAN scheduling logic for per-UE fairness-aware PRB weighting. Four interchangeable "next-value estimators" feed the same weighting formula:
 
 | Controller | Next-value estimation | Classification |
 |---|---|---|
-| `dapp_controller_chronos.py` | BigDL Chronos TCN forecast (`LOOKBACK=10`) | dApp (AI prediction) |
-| `dapp_controller_ewma.py` | Exponentially weighted moving average, `alpha=0.3` (`LOOKBACK=10`) | dApp (lightweight statistical prediction) |
+| `dapp_controller_chronos.py` | BigDL Chronos TCN forecast (`LOOKBACK=10`) | dApp (AI prediction, heaviest) |
+| `dapp_controller_mlp.py` | Shallow MLPRegressor, 1 hidden layer / 12 neurons (`LOOKBACK=10`) | dApp (lightweight AI prediction) |
+| `dapp_controller_ewma.py` | Exponentially weighted moving average, `alpha=0.3` | dApp (lightweight statistical prediction) |
 | `baseline_controller_reactive.py` | No prediction — reuses the just-measured current value | baseline (no AI prediction, **not** a dApp) |
 
-`compute_weights` / `apply_weights` / `run` are identical across all three (copy-pasted intentionally) so `compare_dapp.py` / `plot_dapp_compare.py` can attribute fairness differences purely to the estimation method.
+`compute_weights` / `apply_weights` / `run` are identical across all four (copy-pasted intentionally) so `compare_dapp.py` / `plot_dapp_compare.py` can attribute fairness differences purely to the estimation method. `eval_latency.py` instantiates all four and times `predict_next()` directly to compare inference cost.
 
-**IMPORTANT — no live actuation exists yet.** All three controllers only write to `/tmp/dapp_weights.json`; nothing in the OAI MAC scheduler or an E2 xApp currently reads that file. Fairness numbers from `compare_dapp.py` are computed **offline** by re-weighting already-collected KPI data (`nprb × weights` → estimated `bytes`), not by observing a live scheduler switch. Don't assume "10 min OAI / 10 min Chronos / 10 min Reactive" style live A/B runs are possible without first wiring a real actuation path.
+**IMPORTANT — no live actuation exists yet.** All four controllers only write to `/tmp/dapp_weights.json`; nothing in the OAI MAC scheduler or an E2 xApp currently reads that file. Fairness numbers from `compare_dapp.py` are computed **offline** by re-weighting already-collected KPI data (`nprb × weights` → estimated `bytes`), not by observing a live scheduler switch. Don't assume "10 min OAI / 10 min Chronos / 10 min Reactive" style live A/B runs are possible without first wiring a real actuation path.
 
 ## Key Commands
 
@@ -42,11 +43,15 @@ conda run -n chronos python3 chronos_final.py    # streamlined version
 
 # Retrain Chronos TCN from live data (with 50-epoch checkpoint support)
 conda run -n chronos python3 chronos_retrain.py  # reads kpi_live.csv
+
+# Train the shallow MLP (1 hidden layer, 12 neurons) from kpi_live.csv
+python3 mlp_train.py   # writes mlp_forecaster.pkl / scaler_mlp.pkl, prints per-feature MAE + inference latency
 ```
 
 ### Running the dApp / Baseline Controllers
 ```bash
 conda run -n chronos python3 dapp_controller_chronos.py   # Chronos TCN-based PRB scheduler
+python3 dapp_controller_mlp.py                             # shallow-MLP-based PRB scheduler (plain sklearn, no chronos env needed)
 conda run -n chronos python3 dapp_controller_ewma.py       # EWMA(alpha=0.3)-based PRB scheduler
 python3 baseline_controller_reactive.py                    # no-prediction baseline (plain pandas, no chronos env needed)
 ```
@@ -54,8 +59,9 @@ python3 baseline_controller_reactive.py                    # no-prediction basel
 ### Evaluation & Visualization
 ```bash
 conda run -n chronos python3 eval_dapp.py         # Chronos TCN vs persistence MAE/latency
-conda run -n chronos python3 compare_dapp.py      # OAI default vs Chronos/EWMA dApp vs Reactive Baseline, Jain's fairness
-conda run -n chronos python3 plot_dapp_compare.py # generates dapp_compare.png (4-way)
+conda run -n chronos python3 compare_dapp.py      # OAI default vs Chronos/MLP/EWMA dApp vs Reactive Baseline, Jain's fairness
+conda run -n chronos python3 plot_dapp_compare.py # generates dapp_compare.png (5-way)
+conda run -n chronos python3 eval_latency.py      # times predict_next() on all four controllers back-to-back (same UE, same warmup)
 conda run -n chronos python3 analyze_variability_segments.py  # splits the weak UE's session by SNR rolling-std, compares per-segment
 ```
 `compare_dapp.py`/`plot_dapp_compare.py` auto-select the two UEs with the largest mean-SNR gap from `kpi_live.csv` (`pick_target_ues()`, min 50 samples) rather than hardcoding RNTIs — RNTI is reassigned every session.
@@ -92,10 +98,12 @@ OAI gNB (rfsim)
 
 kpi_*.csv
   ├─► chronos_train.py / chronos_retrain.py → chronos_forecaster / scaler_chronos.pkl
+  ├─► mlp_train.py                          → mlp_forecaster.pkl / scaler_mlp.pkl
   ├─► dapp_controller_chronos.py ─┐
+  ├─► dapp_controller_mlp.py       │
   ├─► dapp_controller_ewma.py      ├─► /tmp/dapp_weights.json (per-RNTI weights)
   ├─► baseline_controller_reactive.py ─┘     └─► OAI gNB MAC scheduler (source patch required — NOT implemented; see note above)
-  └─► compare_dapp.py / plot_dapp_compare.py → offline 4-way Jain's fairness comparison
+  └─► compare_dapp.py / plot_dapp_compare.py → offline 5-way Jain's fairness comparison
 ```
 
 ### KPI Features
@@ -109,10 +117,13 @@ All models share the same 6 features: `snr`, `bler`, `nprb`, `mcs_ul`, `ul_bytes
 | `chronos_final.py` | BigDL `TCNForecaster` 학습 (streamlined) |
 | `chronos_retrain.py` | kpi_live.csv로 재학습; 50 epoch마다 체크포인트 저장 |
 | `chronos_live.py` | 실시간 스트리밍 재학습 |
+| `mlp_train.py` | 얕은 MLPRegressor(은닉층 1개, 뉴런 12개) 학습; LOOKBACK=10 윈도우 flatten 입력 |
 | `dapp_controller_chronos.py` | TCN 예측 기반 PRB 가중치 컨트롤러 |
+| `dapp_controller_mlp.py` | 얕은 MLP 예측 기반 PRB 가중치 컨트롤러 |
 | `dapp_controller_ewma.py` | EWMA(alpha=0.3) 예측 기반 PRB 가중치 컨트롤러 |
 | `baseline_controller_reactive.py` | 예측 없음 — 실측 현재값 그대로 사용 (baseline, dApp 아님) |
 | `collect_kpi_fast.py` | `nrMAC_stats.log` 1Hz 폴링 수집기 |
+| `eval_latency.py` | 4개 컨트롤러의 `predict_next()`를 실제로 반복 호출해 지연시간 비교 |
 | `analyze_variability_segments.py` | 약한 UE SNR rolling-std 기준 변동/안정 구간 분리 + 구간별 fairness 비교 |
 
 ### Fairness Weight Formula
@@ -120,18 +131,30 @@ All models share the same 6 features: `snr`, `bler`, `nprb`, `mcs_ul`, `ul_bytes
 score[ue] = (1 / snr) * (1 + bler * 5)   # higher score → more PRB weight needed
 weight[ue] = score[ue] / sum(scores)
 ```
-Shared by all three controllers. Equal weights are applied when no estimate is available yet (Chronos/EWMA: first `LOOKBACK=10` steps per UE; Reactive Baseline: only the very first cycle).
+Shared by all four controllers. Equal weights are applied when no estimate is available yet (Chronos/MLP/EWMA: first `LOOKBACK=10` steps per UE; Reactive Baseline: only the very first cycle).
 
 ### Model Artifacts
 | File | Contents |
 |---|---|
 | `chronos_forecaster` | BigDL TCNForecaster model |
 | `scaler_chronos.pkl` | `StandardScaler` fitted on training data |
+| `mlp_forecaster.pkl` | `MLPRegressor` (1 hidden layer, 12 neurons), multi-output regression over the 6 KPI features |
+| `scaler_mlp.pkl` | `StandardScaler` fitted on `kpi_live.csv`, shared across UEs |
 
 ### Python Environment
 - Conda env `chronos` (Python 3.9) — `conda run -n chronos python3 <script>`
 - Key deps: `bigdl-chronos`, `scikit-learn`, `joblib`, `pandas`
-- `baseline_controller_reactive.py` and `collect_kpi_fast.py` only need plain `pandas` — no need for the `chronos` env.
+- `baseline_controller_reactive.py`, `dapp_controller_mlp.py`, `mlp_train.py`, and `collect_kpi_fast.py` only need plain `pandas`/`scikit-learn`/`joblib` — no BigDL/torch, no need for the `chronos` env.
+
+### Measured Latency (kpi_fast.csv, n=200 calls, `eval_latency.py`)
+| Controller | Mean | Median | P95 | P99 |
+|---|---|---|---|---|
+| Chronos TCN dApp | 1.7903 ms | 1.6263 ms | 2.9846 ms | 3.6033 ms |
+| MLP dApp | 0.1903 ms | 0.1713 ms | 0.3309 ms | 0.4452 ms |
+| EWMA dApp | 0.0383 ms | 0.0321 ms | 0.0754 ms | 0.1087 ms |
+| Reactive Baseline | 0.0028 ms | 0.0024 ms | 0.0042 ms | 0.0085 ms |
+
+Latency scales with model complexity exactly as expected (TCN ≫ MLP > EWMA > none). The MLP is ~9.4× faster than Chronos TCN while matching or slightly beating its fairness score on this dataset — worth considering as the default when inference latency matters more than marginal fairness gains.
 
 ### Infrastructure Stack
 - **OAI gNB**: `openairinterface5g/` — config at `targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.e2.ej.conf` (Band 78, 106 PRB, rfsim, E2 agent enabled)
@@ -143,4 +166,4 @@ Shared by all three controllers. Equal weights are applied when no estimate is a
   - Only 7 keys are recognized by this OAI build's config parser: `model_name, type, ploss_dB, noise_power_dB, forgetfact, offset, ds_tdl` (`openair1/SIMULATION/TOOLS/sim.h` `CHANNELMOD_PARAMS_DESC`, `random_channel.c`). **`speed_min`/`speed_max`/Doppler-by-speed keys do not exist** — unrecognized keys are silently ignored, not errored. `forgetfact` (0=new channel every call, 1=frozen) is the only real time-variation knob for `TDL_x` models; Doppler (`maxDoppler`) is hardcoded per preset `type` (e.g. `Rayleigh1_800`), not user-settable for `TDL_C`.
 
 ### `oai-channel-prediction/` Subproject
-Scaffold for packaging the ML pipeline as a containerised O-RAN xApp/dApp. Mirrors the root controllers (`dapp_controller_chronos.py`, `dapp_controller_ewma.py`, `baseline_controller_reactive.py` under `src/`, entrypoint reads `kpi_baseline.csv` instead of `kpi_live.csv`). Not yet implemented as an actual xApp/dApp package.
+Scaffold for packaging the ML pipeline as a containerised O-RAN xApp/dApp. Mirrors the root controllers (`dapp_controller_chronos.py`, `dapp_controller_mlp.py`, `dapp_controller_ewma.py`, `baseline_controller_reactive.py` under `src/`, entrypoint reads `kpi_baseline.csv` instead of `kpi_live.csv`). Not yet implemented as an actual xApp/dApp package.

@@ -4,15 +4,16 @@ O-RAN 연구 테스트베드에서 채널 예측/반응형 기법을 활용한 �
 
 ## Overview
 
-OAI gNB 로그에서 실시간으로 UE별 KPI(SNR, BLER, nPRB 등)를 수집하고, 세 가지 방식으로 "다음 스텝"을 추정해 채널 상태가 나쁜 UE에 더 많은 PRB 가중치를 배분합니다.
+OAI gNB 로그에서 실시간으로 UE별 KPI(SNR, BLER, nPRB 등)를 수집하고, 네 가지 방식으로 "다음 스텝"을 추정해 채널 상태가 나쁜 UE에 더 많은 PRB 가중치를 배분합니다.
 
 | 방식 | 다음 값 추정 방법 | 분류 |
 |---|---|---|
-| **Chronos dApp** | BigDL Chronos TCN 모델 예측 (LOOKBACK=10) | dApp (AI 예측) |
-| **EWMA dApp** | 지수가중이동평균(alpha=0.3)으로 다음 값 추정 (LOOKBACK=10) | dApp (경량 통계적 예측) |
+| **Chronos dApp** | BigDL Chronos TCN 모델 예측 (LOOKBACK=10) | dApp (AI 예측, 가장 무거움) |
+| **MLP dApp** | 얕은 MLP(은닉층 1개, 뉴런 12개) 예측 (LOOKBACK=10) | dApp (경량 AI 예측) |
+| **EWMA dApp** | 지수가중이동평균(alpha=0.3)으로 다음 값 추정 | dApp (경량 통계적 예측) |
 | **Reactive Baseline** | 예측 없이 방금 측정한 현재값을 그대로 사용 | baseline (AI 예측 없음, dApp 아님) |
 
-세 방식 모두 `compute_weights`/`apply_weights` 로직은 동일하며(공정 비교를 위해), "다음 값을 어떻게 추정하는가"만 다릅니다.
+네 방식 모두 `compute_weights`/`apply_weights` 로직은 동일하며(공정 비교를 위해), "다음 값을 어떻게 추정하는가"만 다릅니다.
 
 ```
 OAI gNB (rfsim)
@@ -23,10 +24,12 @@ OAI gNB (rfsim)
 
 kpi_*.csv
     ├─► chronos_train.py / chronos_retrain.py        ──► chronos_forecaster / scaler_chronos.pkl
+    ├─► mlp_train.py                                 ──► mlp_forecaster.pkl / scaler_mlp.pkl
     ├─► dapp_controller_chronos.py                   ─┐
+    ├─► dapp_controller_mlp.py                        │
     ├─► dapp_controller_ewma.py                       ├─► /tmp/dapp_weights.json  (scheduling weights per UE RNTI)
     ├─► baseline_controller_reactive.py               ─┘        └─► OAI gNB MAC scheduler (source patch required, 미구현)
-    └─► compare_dapp.py / plot_dapp_compare.py  (4자 오프라인 비교: OAI 기본/Chronos/EWMA/Reactive)
+    └─► compare_dapp.py / plot_dapp_compare.py  (5자 오프라인 비교: OAI 기본/Chronos/MLP/EWMA/Reactive)
 ```
 \* `gnb_live.log`의 UE stats 블록은 시뮬레이션 프레임 카운트 기반 트리거라, WSL2에서 실시간보다 느리게 도는 소프트모뎀 환경에서는 실제로 5~8초에 한 번만 갱신됩니다. 시간에 따른 채널 변동을 제대로 보려면 `collect_kpi_fast.py`로 `nrMAC_stats.log`를 직접 폴링하세요.
 
@@ -34,14 +37,15 @@ kpi_*.csv
 
 실측 테스트베드(비대칭 + 시간변화 채널, 8 Mbps UDP × 2 UE, 1Hz 폴링 `kpi_fast.csv`, 5분)에서 측정한 Jain's Fairness Index (throughput 기준):
 
-| 방식 | Jain's Fairness Index | 향상 | gap 감소 |
-|---|---|---|---|
-| OAI 기본 | 0.9838 | — | — |
-| Chronos dApp | 0.9934 | +0.0096 | 59.2% |
-| Reactive Baseline | 0.9952 | +0.0114 | 70.2% |
-| **EWMA dApp** | **0.9961** | **+0.0123** | **75.8%** |
+| 방식 | Jain's Fairness Index | 향상 | gap 감소 | 추론 지연(평균) |
+|---|---|---|---|---|
+| OAI 기본 | 0.9838 | — | — | — |
+| Chronos dApp | 0.9934 | +0.0096 | 59.2% | 1.7903 ms |
+| MLP dApp | 0.9949 | +0.0111 | 68.6% | 0.1903 ms |
+| Reactive Baseline | 0.9952 | +0.0114 | 70.2% | 0.0028 ms |
+| **EWMA dApp** | **0.9961** | **+0.0123** | **75.8%** | 0.0383 ms |
 
-UE1 (SNR ≈23.5 dB) vs UE2 (SNR ≈20.0 dB, `forgetfact=0.5`로 시간에 따라 변동하는 채널) 환경에서 측정. `compare_dapp.py`가 두 UE 중 SNR 차이가 가장 큰 쌍을 자동으로 선택합니다.
+UE1 (SNR ≈23.5 dB) vs UE2 (SNR ≈20.0 dB, `forgetfact=0.5`로 시간에 따라 변동하는 채널) 환경에서 측정. `compare_dapp.py`가 두 UE 중 SNR 차이가 가장 큰 쌍을 자동으로 선택합니다. 추론 지연은 `eval_latency.py`로 각 컨트롤러의 `predict_next()`를 200회 반복 호출해 측정 (같은 UE, 동일 워밍업). MLP는 Chronos TCN보다 fairness는 비슷하거나 더 좋으면서 추론은 **약 9.4배** 빠릅니다 — 모델 복잡도(TCN > MLP > EWMA > 없음)와 지연시간이 정확히 비례합니다.
 
 ## System Architecture
 
@@ -88,27 +92,32 @@ python3 collect_kpi_fast.py   # → kpi_fast.csv (1Hz)
 ```
 `collect_kpi.py`/`collect_kpi_live.py`가 보는 `gnb_live.log`의 UE stats 블록은 시뮬레이션 프레임 카운트 기반이라 WSL2 환경에서 실제로는 5~8초에 한 번만 갱신됩니다 — 짧은 시간 단위의 채널 변동 분석에는 `collect_kpi_fast.py` 결과(`kpi_fast.csv`)를 쓰세요.
 
-### 3. 모델 학습 (Chronos dApp용)
+### 3. 모델 학습
 ```bash
-# 최초 학습
+# Chronos TCN — 최초 학습
 conda run -n chronos python3 chronos_train.py
 
-# 라이브 데이터로 재학습 (중단 후 재개 가능)
+# Chronos TCN — 라이브 데이터로 재학습 (중단 후 재개 가능)
 conda run -n chronos python3 chronos_retrain.py
+
+# MLP(은닉층 1개, 뉴런 12개) — kpi_live.csv로 학습
+python3 mlp_train.py
 ```
 
 ### 4. dApp / Baseline 컨트롤러 실행
 ```bash
 conda run -n chronos python3 dapp_controller_chronos.py       # TCN 예측 기반
+python3 dapp_controller_mlp.py                                 # 얕은 MLP 예측 기반 (chronos env 불필요)
 conda run -n chronos python3 dapp_controller_ewma.py          # EWMA(alpha=0.3) 예측 기반
 python3 baseline_controller_reactive.py                       # 예측 없음 (Reactive Baseline, AI 미사용)
-# → 셋 다 /tmp/dapp_weights.json 에 UE별 PRB 가중치 실시간 업데이트
+# → 넷 다 /tmp/dapp_weights.json 에 UE별 PRB 가중치 실시간 업데이트
 ```
 
-### 5. 성능 평가 (OAI 기본 / Chronos dApp / EWMA dApp / Reactive Baseline 4자 비교)
+### 5. 성능 평가 (OAI 기본 / Chronos dApp / MLP dApp / EWMA dApp / Reactive Baseline 5자 비교)
 ```bash
 conda run -n chronos python3 compare_dapp.py      # fairness 비교 수치 (SNR 차이 최대인 UE 쌍 자동 선택)
 conda run -n chronos python3 plot_dapp_compare.py # dapp_compare.png 생성
+conda run -n chronos python3 eval_latency.py      # predict_next() 추론 지연시간 비교
 ```
 
 ### 6. (선택) SNR/BLER 변동성 구간 분석
@@ -127,11 +136,14 @@ conda run -n chronos python3 analyze_variability_segments.py
 ├── chronos_final.py                  # TCN 학습 (streamlined)
 ├── chronos_retrain.py                # TCN 재학습 (체크포인트 지원)
 ├── chronos_live.py                   # 실시간 스트리밍 재학습
+├── mlp_train.py                      # 얕은 MLP(은닉층 1개, 뉴런 12개) 학습
 ├── dapp_controller_chronos.py        # PRB 가중치 컨트롤러 — TCN 예측
+├── dapp_controller_mlp.py            # PRB 가중치 컨트롤러 — 얕은 MLP 예측
 ├── dapp_controller_ewma.py           # PRB 가중치 컨트롤러 — EWMA(alpha=0.3) 예측
 ├── baseline_controller_reactive.py   # PRB 가중치 컨트롤러 — 예측 없음 (Reactive Baseline)
 ├── eval_dapp.py                      # 예측 정확도 평가
-├── compare_dapp.py                   # OAI 기본/Chronos/EWMA/Reactive 4자 fairness 비교
+├── eval_latency.py                   # 컨트롤러별 predict_next() 추론 지연시간 비교
+├── compare_dapp.py                   # OAI 기본/Chronos/MLP/EWMA/Reactive 5자 fairness 비교
 ├── plot_dapp_compare.py              # 비교 그래프 생성 (dapp_compare.png)
 ├── analyze_variability_segments.py   # SNR/BLER 변동 구간 vs 안정 구간 분석
 ├── fairness.py                       # Jain's fairness index 출력
@@ -151,7 +163,7 @@ conda run -n chronos python3 analyze_variability_segments.py
 
 ## Fairness Weight Formula
 
-`dapp_controller_chronos.py` / `dapp_controller_ewma.py` / `baseline_controller_reactive.py` 세 컨트롤러가 모두 공유하는 산식입니다 (입력값 — 예측 SNR/BLER vs 실측 SNR/BLER — 만 다름).
+`dapp_controller_chronos.py` / `dapp_controller_mlp.py` / `dapp_controller_ewma.py` / `baseline_controller_reactive.py` 네 컨트롤러가 모두 공유하는 산식입니다 (입력값 — 예측 SNR/BLER vs 실측 SNR/BLER — 만 다름).
 
 ```python
 score[ue] = (1 / snr) * (1 + bler * 5)   # 채널 상태 나쁠수록 높은 score
